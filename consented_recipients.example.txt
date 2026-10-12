@@ -1,0 +1,3 @@
+# Copy this file to consented_recipients.txt.
+# Add one E.164 number per line only after the recipient explicitly opts in.
+# Example format (replace with a consented recipient): +12025550123
