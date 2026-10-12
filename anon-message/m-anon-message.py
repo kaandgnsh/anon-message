@@ -8,13 +8,17 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import hmac
 import json
 import os
 import re
+import secrets
 import sys
+import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import requests
 
@@ -24,6 +28,9 @@ MAX_SENDS_PER_24_HOURS = 5
 MIN_SECONDS_BETWEEN_SENDS = 60
 PHONE_PATTERN = re.compile(r"^\+[1-9]\d{7,14}$")
 FINGERPRINT_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+FINGERPRINT_KEY_BYTES = 32
+LOCK_WAIT_SECONDS = 5.0
+STALE_LOCK_SECONDS = 30.0
 
 
 def normalize_phone(value: str) -> str:
@@ -48,10 +55,11 @@ def validate_message(value: str) -> str:
 
 
 def validate_sender(value: str) -> str:
+    """Require an identifiable sender name accepted by Textbelt."""
     sender = value.strip()
     if not sender:
         raise ValueError("Provide a sender name with --sender.")
-    if len(sender) > 50 or any(ord(char) < 32 for char in sender):
+    if len(sender) > 50 or any(ord(char) < 32 or ord(char) == 127 for char in sender):
         raise ValueError("Sender name must be 1–50 printable characters.")
     return sender
 
@@ -66,6 +74,8 @@ def load_consent_registry(path: Path) -> set[str]:
             "consented_recipients.example.txt to consented_recipients.txt "
             "and add only recipients who explicitly opted in."
         ) from exc
+    except OSError as exc:
+        raise ValueError(f"Could not read consent registry: {path}") from exc
 
     recipients: set[str] = set()
     for line_number, line in enumerate(lines, start=1):
@@ -81,9 +91,55 @@ def load_consent_registry(path: Path) -> set[str]:
     return recipients
 
 
-def recipient_fingerprint(phone: str) -> str:
-    """Hash recipient numbers so the local rate-limit file avoids storing them."""
-    return hashlib.sha256(phone.encode("utf-8")).hexdigest()
+def load_or_create_fingerprint_key(path: Path) -> bytes:
+    """Load or create a private local HMAC key used to pseudonymize recipients."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        key_text = path.read_text(encoding="ascii").strip()
+    except FileNotFoundError:
+        key_text = ""
+    except (OSError, UnicodeError) as exc:
+        raise ValueError(f"Could not read fingerprint key: {path}") from exc
+
+    if not key_text:
+        key_text = secrets.token_hex(FINGERPRINT_KEY_BYTES)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        try:
+            descriptor = os.open(path, flags, 0o600)
+        except FileExistsError:
+            # Another local invocation may have created the key first.
+            try:
+                key_text = path.read_text(encoding="ascii").strip()
+            except (OSError, UnicodeError) as exc:
+                raise ValueError(f"Could not read fingerprint key: {path}") from exc
+        else:
+            try:
+                with os.fdopen(descriptor, "w", encoding="ascii") as key_file:
+                    key_file.write(key_text + "\n")
+                    key_file.flush()
+                    os.fsync(key_file.fileno())
+            except OSError:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+                raise
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
+
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", key_text):
+        raise ValueError(
+            f"Fingerprint key at {path} is invalid. Preserve it for rate-limit "
+            "integrity; do not delete it to reset limits."
+        )
+    return bytes.fromhex(key_text)
+
+
+def recipient_fingerprint(phone: str, secret: bytes) -> str:
+    """Create a keyed HMAC so phone numbers cannot be trivially guessed from state."""
+    return hmac.new(secret, phone.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 def load_state(path: Path) -> dict[str, Any]:
@@ -108,34 +164,39 @@ def load_state(path: Path) -> dict[str, Any]:
         ):
             raise ValueError("Rate-limit state has an invalid entry; refusing to send.")
         try:
-            datetime.fromisoformat(item["at"])
+            recorded_at = datetime.fromisoformat(item["at"])
         except ValueError as exc:
             raise ValueError("Rate-limit state contains an invalid timestamp.") from exc
+        if recorded_at.tzinfo is None:
+            raise ValueError("Rate-limit state contains a timezone-naive timestamp.")
     return state
 
 
 def enforce_rate_limits(
-    state: dict[str, Any], phone: str, now: datetime
+    state: dict[str, Any], phone: str, now: datetime, fingerprint_key: bytes
 ) -> list[dict[str, str]]:
-    """Return recent attempts if global, recipient, and cooldown limits pass."""
-    if now.tzinfo is None:
+    """Return recent attempts if recipient, global, and cooldown limits pass."""
+    if now.tzinfo is None or now.utcoffset() is None:
         raise ValueError("Rate-limit clock must be timezone-aware.")
+
     cutoff = now - timedelta(hours=24)
     attempts: list[dict[str, str]] = []
     for item in state["attempts"]:
         recorded_at = datetime.fromisoformat(item["at"])
-        if recorded_at.tzinfo is None:
+        if recorded_at.tzinfo is None or recorded_at.utcoffset() is None:
             raise ValueError("Rate-limit state contains a timezone-naive timestamp.")
         if recorded_at > now:
             raise ValueError("System clock is earlier than the recorded send time.")
         if recorded_at > cutoff:
             attempts.append(item)
 
-    fingerprint = recipient_fingerprint(phone)
+    fingerprint = recipient_fingerprint(phone, fingerprint_key)
     if any(item["recipient_hash"] == fingerprint for item in attempts):
         raise ValueError("Rate limit: only one send per recipient is allowed every 24 hours.")
     if len(attempts) >= MAX_SENDS_PER_24_HOURS:
-        raise ValueError(f"Rate limit: maximum {MAX_SENDS_PER_24_HOURS} send attempts per 24 hours.")
+        raise ValueError(
+            f"Rate limit: maximum {MAX_SENDS_PER_24_HOURS} send attempts per 24 hours."
+        )
     if attempts:
         most_recent = max(datetime.fromisoformat(item["at"]) for item in attempts)
         if (now - most_recent).total_seconds() < MIN_SECONDS_BETWEEN_SENDS:
@@ -146,37 +207,137 @@ def enforce_rate_limits(
 
 
 def save_state(path: Path, state: dict[str, Any]) -> None:
-    """Write state atomically and restrict permissions where the OS supports it."""
+    """Atomically write state and restrict file permissions where supported."""
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = path.with_name(path.name + ".tmp")
-    temporary_path.write_text(
-        json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
     try:
-        os.chmod(temporary_path, 0o600)
+        with temporary_path.open("w", encoding="utf-8") as state_file:
+            os.chmod(temporary_path, 0o600)
+            json.dump(state, state_file, indent=2, sort_keys=True)
+            state_file.write("\n")
+            state_file.flush()
+            os.fsync(state_file.fileno())
+        temporary_path.replace(path)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
     except OSError:
-        pass
-    temporary_path.replace(path)
+        try:
+            temporary_path.unlink()
+        except OSError:
+            pass
+        raise
+
+
+@contextmanager
+def state_file_lock(
+    path: Path,
+    *,
+    timeout: float = LOCK_WAIT_SECONDS,
+    stale_after: float = STALE_LOCK_SECONDS,
+) -> Iterator[None]:
+    """Serialize local rate-limit reservations across simultaneous CLI processes."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    token = f"{os.getpid()}:{secrets.token_hex(16)}"
+    deadline = time.monotonic() + timeout
+
+    while True:
+        try:
+            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            try:
+                age = time.time() - path.stat().st_mtime
+                if age > stale_after:
+                    # A crashed process may leave a lock behind. Lock sections are
+                    # intentionally short; recover locks older than stale_after.
+                    try:
+                        path.unlink()
+                    except FileNotFoundError:
+                        pass
+                    continue
+            except FileNotFoundError:
+                continue
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"Could not acquire rate-limit lock {path}; another process may be active."
+                )
+            time.sleep(0.05)
+            continue
+        else:
+            try:
+                os.write(descriptor, token.encode("ascii"))
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            break
+
     try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
+        yield
+    finally:
+        try:
+            if path.read_text(encoding="ascii").strip() == token:
+                path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            # A leftover lock is recoverable by the stale-lock check.
+            pass
+
+
+def reserve_send_attempt(
+    state_path: Path,
+    fingerprint_key_path: Path,
+    phone: str,
+    now: datetime,
+) -> None:
+    """Atomically enforce local limits and reserve a send attempt before network I/O."""
+    lock_path = state_path.with_name(state_path.name + ".lock")
+    with state_file_lock(lock_path):
+        fingerprint_key = load_or_create_fingerprint_key(fingerprint_key_path)
+        state = load_state(state_path)
+        recent_attempts = enforce_rate_limits(state, phone, now, fingerprint_key)
+        recent_attempts.append(
+            {
+                "at": now.isoformat(),
+                "recipient_hash": recipient_fingerprint(phone, fingerprint_key),
+            }
+        )
+        state["attempts"] = recent_attempts
+        # Reserve before sending: network failures must not cause automatic retries
+        # that could duplicate an SMS. This is intentionally fail-closed.
+        save_state(state_path, state)
 
 
 def send_sms(phone: str, message: str, api_key: str, sender: str) -> dict[str, Any]:
-    """Send one request to Textbelt and validate its JSON response."""
+    """Send one request to Textbelt and validate its response without following redirects."""
     response = requests.post(
         API_URL,
         data={"phone": phone, "message": message, "key": api_key, "sender": sender},
-        timeout=10,
+        timeout=(3, 10),
+        allow_redirects=False,
     )
-    response.raise_for_status()
+    status_code = response.status_code
+    if 300 <= status_code < 400:
+        raise RuntimeError(
+            f"SMS provider returned HTTP {status_code} redirect; refusing to forward credentials."
+        )
+
     try:
         payload = response.json()
     except ValueError as exc:
+        if status_code >= 400:
+            raise RuntimeError(f"SMS provider returned HTTP {status_code}.") from exc
         raise RuntimeError("SMS provider returned invalid JSON.") from exc
     if not isinstance(payload, dict):
         raise RuntimeError("SMS provider returned an unexpected response.")
+
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        reason = payload.get("error") or payload.get("message") or "HTTP request failed."
+        raise RuntimeError(f"SMS provider returned HTTP {status_code}: {reason}") from exc
+
     if payload.get("success") is not True:
         reason = payload.get("error") or payload.get("message") or "Request rejected."
         raise RuntimeError(f"SMS provider rejected the request: {reason}")
@@ -201,6 +362,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path(".anon-message-state.json"),
         help="Local rate-limit state file (do not delete to bypass limits).",
+    )
+    parser.add_argument(
+        "--fingerprint-key-file",
+        type=Path,
+        default=Path(".anon-message-fingerprint-key"),
+        help="Private local HMAC key used to pseudonymize recipient numbers.",
     )
     parser.add_argument(
         "--send",
@@ -234,16 +401,12 @@ def main(argv: list[str] | None = None) -> int:
         if not api_key:
             raise ValueError("Set TEXTBELT_API_KEY in your environment before using --send.")
 
-        now = datetime.now(timezone.utc)
-        state = load_state(args.state_file)
-        recent_attempts = enforce_rate_limits(state, phone, now)
-        recent_attempts.append(
-            {"at": now.isoformat(), "recipient_hash": recipient_fingerprint(phone)}
+        reserve_send_attempt(
+            args.state_file,
+            args.fingerprint_key_file,
+            phone,
+            datetime.now(timezone.utc),
         )
-        state["attempts"] = recent_attempts
-        # Record the attempt before the request so network errors cannot bypass limits.
-        save_state(args.state_file, state)
-
         payload = send_sms(phone, message, api_key, sender)
         text_id = payload.get("textId")
         print("Textbelt accepted the SMS request; delivery is not guaranteed.")
