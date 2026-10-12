@@ -163,3 +163,10 @@ cython_debug/
 consented_recipients.txt
 .anon-message-state.json
 .anon-message-state.json.tmp
+
+# Local SMS consent and rate-limit secrets (never commit real phone numbers)
+consented_recipients.txt
+.anon-message-state.json
+.anon-message-state.json.tmp
+.anon-message-state.json.lock
+.anon-message-fingerprint-key
