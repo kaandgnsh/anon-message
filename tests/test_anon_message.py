@@ -147,6 +147,21 @@ class RateLimitTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Could not read rate-limit state"):
                 anon_message.load_state(path)
 
+    def test_state_without_original_fingerprint_key_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_path = root / "state.json"
+            key_path = root / "fingerprint-key"
+            state_path.write_text(json.dumps({"attempts": []}), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "Fingerprint key is missing"):
+                anon_message.reserve_send_attempt(
+                    state_path,
+                    key_path,
+                    "+12025550123",
+                    self.now,
+                )
+            self.assertFalse(key_path.exists())
+
     def test_lock_serializes_access_and_cleans_up(self):
         with tempfile.TemporaryDirectory() as directory:
             lock = Path(directory) / "state.lock"
