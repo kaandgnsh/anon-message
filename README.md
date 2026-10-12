@@ -10,11 +10,11 @@ This project is not anonymous. Phone numbers and message contents are sent to th
 - **Explicit consent registry:** a recipient must be listed in a local file before previewing or sending.
 - **Local safety limits:** one attempt per recipient in a rolling 24-hour period, at most five attempts per rolling 24 hours, and at least 60 seconds between attempts.
 - **Safer secret handling:** reads the API key from `TEXTBELT_API_KEY`, not from source code.
-- **Privacy-conscious rate-limit state:** stores recipient hashes rather than plain phone numbers and restricts file permissions where supported.
-- **Timeouts and response validation:** treats provider errors as errors instead of printing a false success message.
+- **Privacy-conscious rate-limit state:** stores keyed HMAC fingerprints instead of plain phone numbers; the random HMAC key is kept in a separate local file with restrictive permissions where supported.
+- **Timeouts and response validation:** bounds connect/read time, rejects redirects to avoid forwarding API credentials, and treats provider errors as errors instead of printing a false success message.
 - **Testable:** unit tests run without sending SMS messages or contacting Textbelt.
 
-The local rate limits are guardrails for a single local copy, not a billing or abuse-prevention guarantee. Do not delete or edit the state file to bypass them. They do not coordinate across multiple computers.
+The local rate limits are best-effort guardrails, not a billing or abuse-prevention guarantee. A local file lock serializes concurrent invocations on the same host. Limits are not shared across computers and may not be reliable on network filesystems. Keep both `.anon-message-state.json` and `.anon-message-fingerprint-key` intact; if state exists but the key is missing, the tool fails closed. Anyone with local access can still alter or remove local files, so do not treat these limits as a production security boundary.
 
 ## Requirements
 
