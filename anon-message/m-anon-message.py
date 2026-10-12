@@ -212,7 +212,10 @@ def save_state(path: Path, state: dict[str, Any]) -> None:
     temporary_path = path.with_name(path.name + ".tmp")
     try:
         with temporary_path.open("w", encoding="utf-8") as state_file:
-            os.chmod(temporary_path, 0o600)
+            try:
+                os.chmod(temporary_path, 0o600)
+            except OSError:
+                pass
             json.dump(state, state_file, indent=2, sort_keys=True)
             state_file.write("\n")
             state_file.flush()
@@ -294,6 +297,13 @@ def reserve_send_attempt(
     """Atomically enforce local limits and reserve a send attempt before network I/O."""
     lock_path = state_path.with_name(state_path.name + ".lock")
     with state_file_lock(lock_path):
+        # A state file without its original HMAC key cannot enforce recipient-specific
+        # limits reliably. Fail closed instead of silently generating a replacement key.
+        if state_path.exists() and not fingerprint_key_path.exists():
+            raise ValueError(
+                f"Fingerprint key is missing while rate-limit state exists. Restore "
+                f"{fingerprint_key_path}; do not delete it to reset limits."
+            )
         fingerprint_key = load_or_create_fingerprint_key(fingerprint_key_path)
         state = load_state(state_path)
         recent_attempts = enforce_rate_limits(state, phone, now, fingerprint_key)
